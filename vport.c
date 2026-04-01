@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <arpa/inet.h>
 #include <net/ethernet.h>
+#include <netdb.h>
 #include <pthread.h>
 
 /**
@@ -83,9 +84,18 @@ void vport_init(struct vport_t *vport, const char *server_ip_str, int server_por
   memset(&vswitch_addr, 0, sizeof(vswitch_addr));
   vswitch_addr.sin_family = AF_INET;
   vswitch_addr.sin_port = htons(server_port);
-  if (inet_pton(AF_INET, server_ip_str, &vswitch_addr.sin_addr) != 1)
+  
+  // Try inet_pton first (for IP addresses)
+  int pton_result = inet_pton(AF_INET, server_ip_str, &vswitch_addr.sin_addr);
+  if (pton_result <= 0)
   {
-    ERROR_PRINT_THEN_EXIT("fail to inet_pton: %s\n", strerror(errno));
+    // If inet_pton fails, try gethostbyname for hostnames like "localhost"
+    struct hostent *host = gethostbyname(server_ip_str);
+    if (host == NULL)
+    {
+      ERROR_PRINT_THEN_EXIT("fail to resolve address: %s\n", server_ip_str);
+    }
+    memcpy(&vswitch_addr.sin_addr, host->h_addr_list[0], host->h_length);
   }
 
   vport->tapfd = tapfd;
