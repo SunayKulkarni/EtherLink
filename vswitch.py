@@ -46,9 +46,6 @@ def validate_frame(data, vport_addr):
     if frame_size < ETHERNET_HEADER_SIZE:
         return False, None, None, f"Frame too small ({frame_size} < {ETHERNET_HEADER_SIZE})"
     
-    if frame_size < ETHERNET_FRAME_MIN:
-        return False, None, None, f"Frame below minimum ({frame_size} < {ETHERNET_FRAME_MIN})"
-    
     if frame_size > ETHERNET_FRAME_MAX:
         return False, None, None, f"Frame exceeds maximum ({frame_size} > {ETHERNET_FRAME_MAX})"
     
