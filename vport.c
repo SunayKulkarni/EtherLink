@@ -106,6 +106,51 @@ void vport_init(struct vport_t *vport, const char *server_ip_str, int server_por
 }
 
 /**
+ * Validate Ethernet frame: check size and header validity
+ * Returns 1 if valid, 0 if invalid
+ */
+static int validate_ethernet_frame(const char *data, int datasz)
+{
+  // Minimum: Ethernet header (14 bytes) + payload
+  static const int ETHERNET_FRAME_MIN = 64;
+  static const int ETHERNET_FRAME_MAX = 1518;
+  static const int ETHERNET_HEADER_SIZE = 14;
+
+  // Check size bounds
+  if (datasz < ETHERNET_HEADER_SIZE)
+  {
+    fprintf(stderr, "[VPort] INVALID: Frame too small (%d < %d)\n", datasz, ETHERNET_HEADER_SIZE);
+    return 0;
+  }
+
+  /*if (datasz < ETHERNET_FRAME_MIN)
+  {
+    fprintf(stderr, "[VPort] INVALID: Frame below minimum (%d < %d)\n", datasz, ETHERNET_FRAME_MIN);
+    return 0;
+  }
+ */
+
+
+  if (datasz > ETHERNET_FRAME_MAX)
+  {
+    fprintf(stderr, "[VPort] INVALID: Frame exceeds maximum (%d > %d)\n", datasz, ETHERNET_FRAME_MAX);
+    return 0;
+  }
+
+  // Validate Ethernet header
+  const struct ether_header *hdr = (const struct ether_header *)data;
+
+  // Check that we can safely read the header
+  if ((uintptr_t)hdr + sizeof(struct ether_header) > (uintptr_t)data + datasz)
+  {
+    fprintf(stderr, "[VPort] INVALID: Insufficient buffer for Ethernet header\n");
+    return 0;
+  }
+
+  return 1;
+}
+
+/**
  * Forward ethernet frame from TAP device to VSwitch
  */
 void *forward_ether_data_to_vswitch(void *raw_vport)
@@ -116,28 +161,52 @@ void *forward_ether_data_to_vswitch(void *raw_vport)
   {
     // read ethernet from tap device
     int ether_datasz = read(vport->tapfd, ether_data, sizeof(ether_data));
-    if (ether_datasz > 0)
+    
+    if (ether_datasz < 0)
     {
-      assert(ether_datasz >= 14);
-      const struct ether_header *hdr = (const struct ether_header *)ether_data;
-
-      // forward ethernet frame to VSwitch
-      ssize_t sendsz = sendto(vport->vport_sockfd, ether_data, ether_datasz, 0, (struct sockaddr *)&vport->vswitch_addr, sizeof(vport->vswitch_addr));
-      if (sendsz != ether_datasz)
-      {
-        fprintf(stderr, "sendto size mismatch: ether_datasz=%d, sendsz=%d\n", ether_datasz, sendsz);
-      }
-
-      printf("[VPort] Sent to VSwitch:"
-             " dhost<%02x:%02x:%02x:%02x:%02x:%02x>"
-             " shost<%02x:%02x:%02x:%02x:%02x:%02x>"
-             " type<%04x>"
-             " datasz=<%d>\n",
-             hdr->ether_dhost[0], hdr->ether_dhost[1], hdr->ether_dhost[2], hdr->ether_dhost[3], hdr->ether_dhost[4], hdr->ether_dhost[5],
-             hdr->ether_shost[0], hdr->ether_shost[1], hdr->ether_shost[2], hdr->ether_shost[3], hdr->ether_shost[4], hdr->ether_shost[5],
-             ntohs(hdr->ether_type),
-             ether_datasz);
+      fprintf(stderr, "[VPort] ERROR: read from TAP failed: %s\n", strerror(errno));
+      continue;
     }
+
+    if (ether_datasz == 0)
+    {
+      fprintf(stderr, "[VPort] WARNING: read from TAP returned 0 bytes\n");
+      continue;
+    }
+
+    // Validate frame before processing
+    if (!validate_ethernet_frame(ether_data, ether_datasz))
+    {
+      continue;  // Skip invalid frame
+    }
+
+    const struct ether_header *hdr = (const struct ether_header *)ether_data;
+
+    // forward ethernet frame to VSwitch
+    ssize_t sendsz = sendto(vport->vport_sockfd, ether_data, ether_datasz, 0, 
+                            (struct sockaddr *)&vport->vswitch_addr, sizeof(vport->vswitch_addr));
+    if (sendsz < 0)
+    {
+      fprintf(stderr, "[VPort] ERROR: sendto failed: %s\n", strerror(errno));
+      continue;
+    }
+
+    if (sendsz != ether_datasz)
+    {
+      fprintf(stderr, "[VPort] WARNING: sendto size mismatch: ether_datasz=%d, sendsz=%zd\n", 
+              ether_datasz, sendsz);
+      continue;
+    }
+
+    printf("[VPort] Sent to VSwitch:"
+           " dhost<%02x:%02x:%02x:%02x:%02x:%02x>"
+           " shost<%02x:%02x:%02x:%02x:%02x:%02x>"
+           " type<%04x>"
+           " datasz=<%d>\n",
+           hdr->ether_dhost[0], hdr->ether_dhost[1], hdr->ether_dhost[2], hdr->ether_dhost[3], hdr->ether_dhost[4], hdr->ether_dhost[5],
+           hdr->ether_shost[0], hdr->ether_shost[1], hdr->ether_shost[2], hdr->ether_shost[3], hdr->ether_shost[4], hdr->ether_shost[5],
+           ntohs(hdr->ether_type),
+           ether_datasz);
   }
 }
 
@@ -148,33 +217,58 @@ void *forward_ether_data_to_tap(void *raw_vport)
 {
   struct vport_t *vport = (struct vport_t *)raw_vport;
   char ether_data[ETHER_MAX_LEN];
+  socklen_t vswitch_addr_len;
+  
   while (true)
   {
     // read ethernet frame from VSwitch
-    socklen_t vswitch_addr = sizeof(vport->vswitch_addr);
+    vswitch_addr_len = sizeof(vport->vswitch_addr);
     int ether_datasz = recvfrom(vport->vport_sockfd, ether_data, sizeof(ether_data), 0,
-                                (struct sockaddr *)&vport->vswitch_addr, &vswitch_addr);
-    if (ether_datasz > 0)
+                                (struct sockaddr *)&vport->vswitch_addr, &vswitch_addr_len);
+    
+    if (ether_datasz < 0)
     {
-      assert(ether_datasz >= 14);
-      const struct ether_header *hdr = (const struct ether_header *)ether_data;
-
-      // forward ethernet frame to TAP device (Linux network stack)
-      ssize_t sendsz = write(vport->tapfd, ether_data, ether_datasz);
-      if (sendsz != ether_datasz)
-      {
-        fprintf(stderr, "sendto size mismatch: ether_datasz=%d, sendsz=%d\n", ether_datasz, sendsz);
-      }
-
-      printf("[VPort] Forward to TAP device:"
-             " dhost<%02x:%02x:%02x:%02x:%02x:%02x>"
-             " shost<%02x:%02x:%02x:%02x:%02x:%02x>"
-             " type<%04x>"
-             " datasz=<%d>\n",
-             hdr->ether_dhost[0], hdr->ether_dhost[1], hdr->ether_dhost[2], hdr->ether_dhost[3], hdr->ether_dhost[4], hdr->ether_dhost[5],
-             hdr->ether_shost[0], hdr->ether_shost[1], hdr->ether_shost[2], hdr->ether_shost[3], hdr->ether_shost[4], hdr->ether_shost[5],
-             ntohs(hdr->ether_type),
-             ether_datasz);
+      fprintf(stderr, "[VPort] ERROR: recvfrom failed: %s\n", strerror(errno));
+      continue;
     }
+
+    if (ether_datasz == 0)
+    {
+      fprintf(stderr, "[VPort] WARNING: recvfrom returned 0 bytes\n");
+      continue;
+    }
+
+    // Validate frame before writing to TAP
+    if (!validate_ethernet_frame(ether_data, ether_datasz))
+    {
+      continue;  // Skip invalid frame
+    }
+
+    const struct ether_header *hdr = (const struct ether_header *)ether_data;
+
+    // forward ethernet frame to TAP device (Linux network stack)
+    ssize_t sendsz = write(vport->tapfd, ether_data, ether_datasz);
+    if (sendsz < 0)
+    {
+      fprintf(stderr, "[VPort] ERROR: write to TAP failed: %s\n", strerror(errno));
+      continue;
+    }
+
+    if (sendsz != ether_datasz)
+    {
+      fprintf(stderr, "[VPort] WARNING: write size mismatch: ether_datasz=%d, sendsz=%zd\n", 
+              ether_datasz, sendsz);
+      continue;
+    }
+
+    printf("[VPort] Forward to TAP device:"
+           " dhost<%02x:%02x:%02x:%02x:%02x:%02x>"
+           " shost<%02x:%02x:%02x:%02x:%02x:%02x>"
+           " type<%04x>"
+           " datasz=<%d>\n",
+           hdr->ether_dhost[0], hdr->ether_dhost[1], hdr->ether_dhost[2], hdr->ether_dhost[3], hdr->ether_dhost[4], hdr->ether_dhost[5],
+           hdr->ether_shost[0], hdr->ether_shost[1], hdr->ether_shost[2], hdr->ether_shost[3], hdr->ether_shost[4], hdr->ether_shost[5],
+           ntohs(hdr->ether_type),
+           ether_datasz);
   }
 }

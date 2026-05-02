@@ -92,6 +92,24 @@ sudo ip link set tapyuan up
 ping 10.1.1.101
 ```
 
+## File Transfer Demo
+
+Once both TAP interfaces can ping each other, you can demonstrate application traffic by sending a file over the virtual LAN with the included TCP helper script.
+
+### Receiver
+
+```bash
+python3 file_transfer_demo.py receive 10.1.1.101 5000 received.bin
+```
+
+### Sender
+
+```bash
+python3 file_transfer_demo.py send 10.1.1.101 5000 demo.bin
+```
+
+The script prints the transferred byte count and SHA256 hash on both sides so you can verify that the file arrived intact.
+
 ## Technical Highlights
 
 - **Raw Socket Programming**: Direct manipulation of Ethernet frames at Layer 2

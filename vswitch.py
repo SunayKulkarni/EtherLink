@@ -4,13 +4,19 @@
 import socket
 import sys
 import os
+import time
+import threading
 
 # ════════════════════════════════════════════════════════════
-# Input validation constants
+# Configuration constants
 # ════════════════════════════════════════════════════════════
 ETHERNET_FRAME_MIN = 64  # Minimum Ethernet frame size (bytes)
 ETHERNET_FRAME_MAX = 1518  # Maximum Ethernet frame size (bytes)
 ETHERNET_HEADER_SIZE = 14
+
+# MAC aging configuration
+MAC_AGING_TIMEOUT = 1800  # 30 minutes: remove MAC entries after this many seconds
+MAC_AGING_CHECK_INTERVAL = 60  # Check every 60 seconds for stale entries
 
 # ════════════════════════════════════════════════════════════
 # Helper functions for validation
@@ -66,25 +72,45 @@ def validate_frame(data, vport_addr):
     except Exception as e:
         return False, None, None, f"Header parsing error: {str(e)}"
 
+def age_mac_entries(mac_table, current_time, timeout=MAC_AGING_TIMEOUT):
+    """
+    Remove MAC entries that haven't been seen for 'timeout' seconds
+    Returns: (removed_count, remaining_count)
+    """
+    expired_macs = []
+    
+    for mac_addr, (vport_addr, timestamp) in mac_table.items():
+        if current_time - timestamp > timeout:
+            expired_macs.append(mac_addr)
+    
+    # Remove expired entries
+    for mac_addr in expired_macs:
+        vport_addr, timestamp = mac_table.pop(mac_addr)
+        age_seconds = current_time - timestamp
+        print(f"[VSwitch] AGED: {mac_addr} → {vport_addr} (age: {age_seconds:.0f}s)")
+    
+    return len(expired_macs), len(mac_table)
+
 # ════════════════════════════════════════════════════════════
 # Main VSwitch
 # ════════════════════════════════════════════════════════════
 
 # parse parameters
 server_port = None
-if len(sys.argv) != 2:
-    print("Usage: python3 vswitch.py {VSWITCH_PORT}")
+if len(sys.argv) < 2 or len(sys.argv) > 3:
+    print("Usage: python3 vswitch.py {VSWITCH_PORT} [BIND_IP]")
     sys.exit(1)
 else:
     try:
         server_port = int(sys.argv[1])
         if server_port < 1 or server_port > 65535:
             raise ValueError("Port out of range")
+        server_ip = sys.argv[2] if len(sys.argv) == 3 else "0.0.0.0"
     except ValueError as e:
         print(f"Error: Invalid port ({e})")
         sys.exit(1)
 
-server_addr = ("0.0.0.0", server_port)
+server_addr = (server_ip, server_port)
 
 # 0. create UDP socket, bind to service port
 try:
@@ -103,11 +129,24 @@ stats = {
     "frames_invalid": 0
 }
 
+# Track time for MAC aging
+last_aging_check = time.time()
+
 while True:
     try:
+        current_time = time.time()
+        
+        # Periodically check for and remove stale MAC entries
+        if current_time - last_aging_check > MAC_AGING_CHECK_INTERVAL:
+            removed, remaining = age_mac_entries(mac_table, current_time)
+            if removed > 0:
+                print(f"    MAC Table: {remaining} entries")
+            last_aging_check = current_time
+        
         # 1. read ethernet frame from VPort
         data, vport_addr = vserver_sock.recvfrom(ETHERNET_FRAME_MAX + 100)  # Extra buffer
         stats["frames_received"] += 1
+        current_time = time.time()
 
         # 2. validate ethernet frame
         is_valid, eth_src, eth_dst, error_reason = validate_frame(data, vport_addr)
@@ -125,16 +164,17 @@ while True:
             f"src<{eth_src}> dst<{eth_dst}> datasz<{len(data)}>"
         )
 
-        # 4. insert/update mac table
-        if eth_src not in mac_table or mac_table[eth_src] != vport_addr:
-            mac_table[eth_src] = vport_addr
+        # 4. insert/update mac table with timestamp
+        if eth_src not in mac_table or mac_table[eth_src][0] != vport_addr:
+            mac_table[eth_src] = (vport_addr, current_time)
             print(f"    Learned: {eth_src} → {vport_addr}")
 
         # 5. forward ethernet frame
         #    if dest in mac table, forward ethernet frame to it
         if eth_dst in mac_table:
             try:
-                vserver_sock.sendto(data, mac_table[eth_dst])
+                vport_dest, _ = mac_table[eth_dst]
+                vserver_sock.sendto(data, vport_dest)
                 stats["frames_forwarded"] += 1
                 print(f"    Forwarded to: {eth_dst}")
             except Exception as e:
@@ -147,7 +187,7 @@ while True:
                 brd_dst_macs = list(mac_table.keys())
                 if eth_src in brd_dst_macs:
                     brd_dst_macs.remove(eth_src)
-                brd_dst_vports = {mac_table[mac] for mac in brd_dst_macs}
+                brd_dst_vports = {mac_table[mac][0] for mac in brd_dst_macs}
                 
                 if brd_dst_vports:
                     print(f"    Broadcasted to {len(brd_dst_vports)} peer(s)")
